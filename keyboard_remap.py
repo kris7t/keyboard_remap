@@ -4,7 +4,7 @@ import asyncio
 import enum
 import logging
 import signal
-import time
+from collections import defaultdict
 
 import evdev
 import pyudev
@@ -331,15 +331,48 @@ class Keyboard:
         if name.startswith(REMAPPED_PREFIX):
             self._device.close()
             raise AlreadyRemappedError()
+        capabilities = defaultdict(set)
+        for ev_type, ev_codes in self._device.capabilities().items():
+            if ev_type != evdev.ecodes.EV_SYN and ev_type != evdev.ecodes.EV_FF:
+                capabilities[ev_type].update(ev_codes)
+        capabilities[evdev.ecodes.EV_KEY].update({
+            evdev.ecodes.KEY_ESC,
+            evdev.ecodes.KEY_COMPOSE,
+            evdev.ecodes.KEY_F13,
+            evdev.ecodes.KEY_F14,
+            evdev.ecodes.KEY_F15,
+            evdev.ecodes.KEY_F16,
+            evdev.ecodes.KEY_F17,
+            evdev.ecodes.KEY_F18,
+            evdev.ecodes.KEY_F18,
+            evdev.ecodes.KEY_F20,
+            evdev.ecodes.KEY_F21,
+            evdev.ecodes.KEY_F22,
+            evdev.ecodes.KEY_F23,
+            evdev.ecodes.KEY_F24,
+            evdev.ecodes.KEY_FILE,
+            evdev.ecodes.KEY_HOMEPAGE,
+            evdev.ecodes.KEY_CALC,
+            evdev.ecodes.KEY_CONFIG,
+            evdev.ecodes.KEY_PREVIOUSSONG,
+            evdev.ecodes.KEY_NEXTSONG,
+            evdev.ecodes.KEY_PLAYPAUSE,
+            evdev.ecodes.KEY_STOP,
+            evdev.ecodes.KEY_MUTE,
+            evdev.ecodes.KEY_VOLUMEDOWN,
+            evdev.ecodes.KEY_VOLUMEUP,
+            evdev.ecodes.KEY_PROG1,
+            evdev.ecodes.KEY_PROG2,
+        })
         try:
-            self._uinput = evdev.UInput.from_device(
-                self._device, name=f'{REMAPPED_PREFIX} {name}')
+            self._uinput = evdev.UInput(
+                events=capabilities, name=f'{REMAPPED_PREFIX} {name}')
         except:
             self._device.close()
             raise
         self._logger = self._logger.getChild(name)
         self._logger.info('Initialized at %s', path)
-        right_alt = VirtualModifier(self, evdev.ecodes.KEY_CAPSLOCK)
+        right_alt = VirtualModifier(self, evdev.ecodes.KEY_RIGHTALT)
         fn = VirtualModifier(self, None)
         self._virtual_modifiers = [right_alt, fn]
         basic_key = Key(self)
@@ -367,7 +400,7 @@ class Keyboard:
             evdev.ecodes.KEY_COMPOSE: ModifierKey(self, fn),
             evdev.ecodes.KEY_F1: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F13, evdev.ecodes.KEY_F1, right_alt),
-                fn, RemapKey(self, evdev.ecodes.KEY_COMPUTER)),
+                fn, RemapKey(self, evdev.ecodes.KEY_FILE)),
             evdev.ecodes.KEY_F2: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F14, evdev.ecodes.KEY_F2, right_alt),
                 fn, RemapKey(self, evdev.ecodes.KEY_HOMEPAGE)),
@@ -376,13 +409,13 @@ class Keyboard:
                 fn, RemapKey(self, evdev.ecodes.KEY_CALC)),
             evdev.ecodes.KEY_F4: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F16, evdev.ecodes.KEY_F4, right_alt),
-                fn, RemapKey(self, evdev.ecodes.KEY_MEDIA)),
+                fn, RemapKey(self, evdev.ecodes.KEY_CONFIG)),
             evdev.ecodes.KEY_F5: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F17, evdev.ecodes.KEY_F5, right_alt),
-                fn, RemapKey(self, evdev.ecodes.KEY_NEXTSONG)),
+                fn, RemapKey(self, evdev.ecodes.KEY_PREVIOUSSONG)),
             evdev.ecodes.KEY_F6: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F18, evdev.ecodes.KEY_F6, right_alt),
-                fn, RemapKey(self, evdev.ecodes.KEY_PREVIOUSSONG)),
+                fn, RemapKey(self, evdev.ecodes.KEY_NEXTSONG)),
             evdev.ecodes.KEY_F7: ModKey(
                 SecondTouchKey(self, evdev.ecodes.KEY_F19, evdev.ecodes.KEY_F7, right_alt),
                 fn, RemapKey(self, evdev.ecodes.KEY_PLAYPAUSE)),
@@ -401,13 +434,13 @@ class Keyboard:
             evdev.ecodes.KEY_F12: SecondTouchKey(
                 self, evdev.ecodes.KEY_F24, evdev.ecodes.KEY_F12, right_alt),
             evdev.ecodes.KEY_SYSRQ: ModKey(
-                RemapKey(self, evdev.ecodes.KEY_PROG3), right_alt, basic_key),
+                RemapKey(self, evdev.ecodes.KEY_PROG1), right_alt, basic_key),
             evdev.ecodes.KEY_SCROLLLOCK: ModKey(
-                RemapKey(self, evdev.ecodes.KEY_PROG3), right_alt, basic_key),
+                RemapKey(self, evdev.ecodes.KEY_PROG1), right_alt, basic_key),
             evdev.ecodes.KEY_PAUSE: ModKey(
-                RemapKey(self, evdev.ecodes.KEY_PROG4), right_alt, basic_key),
+                RemapKey(self, evdev.ecodes.KEY_PROG2), right_alt, basic_key),
             evdev.ecodes.KEY_BREAK: ModKey(
-                RemapKey(self, evdev.ecodes.KEY_PROG4), right_alt, basic_key),
+                RemapKey(self, evdev.ecodes.KEY_PROG2), right_alt, basic_key),
         }
         self._default_key = TriggerKey(
             basic_key, left_meta.silence_release, right_meta.silence_release,
@@ -422,12 +455,20 @@ class Keyboard:
                     self._process_event(event)
         except asyncio.CancelledError:
             pass
+        except OSError:
+            return
         except:
             interrupted.set()
             raise
         finally:
-            self._uinput.close()
-            self._device.close()
+            try:
+                self._uinput.close()
+            except asyncio.CancelledError | OSError:
+                pass
+            try:
+                self._device.close()
+            except asyncio.CancelledError | OSError:
+                pass
             self._logger.info('Closed')
 
     def _process_event(self, event):
@@ -551,6 +592,8 @@ async def main(timeout):
     loop.add_signal_handler(signal.SIGINT, interrupted.set)
     if timeout:
         timeout_task = asyncio.create_task(_timeout(timeout, interrupted))
+    else:
+        timeout_task = None
     keyboard_remapper = KeyboardRemapper(interrupted)
     try:
         await keyboard_remapper.start()
