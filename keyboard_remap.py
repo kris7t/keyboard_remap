@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 
 import asyncio
-import evdev
+import enum
 import logging
-import pyudev
 import signal
+import time
+
+import evdev
+import pyudev
 
 REMAPPED_PREFIX = '[remapped]'
 
@@ -13,21 +16,32 @@ class AlreadyRemappedError(Exception):
     pass
 
 
+class VirtualModifierState(enum.Enum):
+    RELEASED = enum.auto()
+    PRESSED_SILENT = enum.auto()
+    PRESSED_NOISY = enum.auto()
+
+
 class VirtualModifier():
     def __init__(self, keyboard, code):
         self._keyboard = keyboard
         self.code = code
         self._pressed_keys = []
-        self._previous_state = False
+        self._state = VirtualModifierState.RELEASED
+        self._previous_state = self._state
         self._callbacks = []
 
     @property
-    def pressed(self):
-        return bool(self._pressed_keys)
+    def active(self):
+        return self._state != VirtualModifierState.RELEASED
+
+    @property
+    def noisy(self):
+        return self._state == VirtualModifierState.PRESSED_NOISY
 
     @property
     def repeating_key(self):
-        if self._pressed_keys:
+        if self._state == VirtualModifierState.PRESSED_NOISY:
             self._pressed_keys[0]
         else:
             None
@@ -36,29 +50,47 @@ class VirtualModifier():
         self._callbacks.append(callback)
 
     def press(self, key):
-        was_pressed = self.pressed
         if key not in self._pressed_keys:
             self._pressed_keys.append(key)
-        if not was_pressed:
-            self.trigger()
+        if len(self._pressed_keys) >= 2:
+            self.trigger_noisy()
 
     def release(self, key):
         self._pressed_keys.remove(key)
+        if not self._pressed_keys:
+            self._state = VirtualModifierState.RELEASED
 
-    def trigger(self):
+    def trigger_silent(self):
+        if self._pressed_keys and self._state == VirtualModifierState.RELEASED:
+            self._state = VirtualModifierState.PRESSED_SILENT
+            self._trigger()
+
+    def trigger_noisy(self):
+        if not self.code:
+            self.trigger_silent()
+            return
+        if self._pressed_keys and self._state == VirtualModifierState.RELEASED:
+            self._state = VirtualModifierState.PRESSED_NOISY
+            self._trigger()
+        elif self._state == VirtualModifierState.PRESSED_SILENT:
+            self._state = VirtualModifierState.PRESSED_NOISY
+
+    def _trigger(self):
         for callback in self._callbacks:
             callback()
 
     def flush_state_change(self, sync_event):
-        if self.pressed and not self._previous_state:
+        noisy = self._state == VirtualModifierState.PRESSED_NOISY
+        previous_noisy = self._previous_state == VirtualModifierState.PRESSED_NOISY
+        if noisy and not previous_noisy:
             self._keyboard.write_event(
                 evdev.InputEvent(sync_event.sec, sync_event.usec,
                                  evdev.ecodes.EV_KEY, self.code, 1))
-        elif not self.pressed and self._previous_state:
+        elif not noisy and previous_noisy:
             self._keyboard.write_event(
                 evdev.InputEvent(sync_event.sec, sync_event.usec,
                                  evdev.ecodes.EV_KEY, self.code, 0))
-        self._previous_state = self.pressed
+        self._previous_state = self._state
 
 
 class Key:
@@ -68,13 +100,16 @@ class Key:
     def process_event(self, event):
         return True
 
+    def flush_state_change(self, sync_event):
+        pass
+
     def flush_event(self, event):
         self._keyboard.write_event(event)
 
 
-class TriggerKey(Key):
-    def __init__(self, keyboard, *callbacks):
-        super().__init__(keyboard)
+class TriggerKey:
+    def __init__(self, key, *callbacks):
+        self._key = key
         self._callbacks = callbacks
 
     def _trigger(self):
@@ -82,17 +117,27 @@ class TriggerKey(Key):
             callback()
 
     def process_event(self, event):
-        if event.value == 1 or event.value == 2:
+        if event.value == 1:
             self._trigger()
-        return super().process_event(event)
+        return self._key.process_event(event)
+
+    def flush_state_change(self, sync_event):
+        self._key.flush_state_change(sync_event)
+
+    def flush_event(self, event):
+        self._key.flush_event(event)
+
+    def __getattr__(self, name):
+        return self._key.__getattribute__(name)
 
 
-class ModifierKey(Key):
-    def __init__(self, keyboard, virtual_modifier):
-        super().__init__(keyboard)
+class VirtualModifierKey(Key):
+    def __init__(self, keyboard, virtual_modifier, **kwargs):
+        super().__init__(keyboard, **kwargs)
         self._virtual_modifier = virtual_modifier
 
     def process_event(self, event):
+        super().process_event(event)
         if event.value == 0:
             self._virtual_modifier.release(self)
             return False
@@ -100,91 +145,183 @@ class ModifierKey(Key):
             self._virtual_modifier.press(self)
             return False
         else:
-            return True
+            return self._virtual_modifier.noisy
 
     def flush_event(self, event):
         if event.value == 2 and self._virtual_modifier.repeating_key is self:
             event.code = self._virtual_modifier.code
-            super().flush_event(event)
+            self._keyboard.write_event(event)
 
 
-class TriggeredModifierKey(ModifierKey):
-    def __init__(self, keyboard, single_code, virtual_modifier):
+class ModifierKey(VirtualModifierKey):
+    def __init__(self, keyboard, virtual_modifier, silent=False):
         super().__init__(keyboard, virtual_modifier)
-        virtual_modifier.add_callback(self._trigger)
-        self._single_code = single_code
-        self._pressed = False
-        self._triggered = False
-
-    def _trigger(self):
-        if self._pressed and not self._triggered:
-            self._virtual_modifier.press(self)
-            self._triggered = True
+        self._silent = silent
 
     def process_event(self, event):
-        if event.value == 0:
-            self._pressed = False
-            if self._triggered:
-                self._triggered = False
-                self._virtual_modifier.release(self)
-                return False
-            else:
-                return True
+        ret = super().process_event(event)
         if event.value == 1:
-            self._pressed = True
-            self._triggered = self._virtual_modifier.pressed
-            return False
-        if event.value == 2:
-            return self._triggered
-
-    def flush_event(self, event):
-        if event.value == 0:
-            if self._triggered:
-                self._triggered = False
+            if self._silent:
+                self._virtual_modifier.trigger_silent()
             else:
-                event.code = self._single_code
-                event.value = 1
-                self._keyboard.write_event(event)
-                event.value = 0
-                self._keyboard.write_event(event)
-        else:
-            super().flush_event(event)
+                self._virtual_modifier.trigger_noisy()
+        return ret
 
 
-class OnReleaseKey(TriggerKey):
-    def __init__(self, keyboard, extra_code, *callbacks):
-        super().__init__(keyboard)
+class OnReleaseState(enum.Enum):
+    RELEASED = enum.auto()
+    PRESSED_SINGLE = enum.auto()
+    PRESSED_SILENT = enum.auto()
+
+
+class OnReleaseKey(Key):
+    def __init__(self, keyboard, extra_code, silence_modifier=None, callbacks=None, **kwargs):
+        super().__init__(keyboard, **kwargs)
         self._extra_code = extra_code
-        self._pressed = False
-        self._triggered = False
+        self._silence_modifier = silence_modifier
+        if silence_modifier:
+            silence_modifier.add_callback(self.silence_release)
+        self._callbacks = callbacks
+        self._state = OnReleaseState.RELEASED
+        self._previous_state = self._state
 
-    def trigger(self):
-        if self._pressed and not self._triggered:
-            self._triggered = True
+    def silence_release(self):
+        if self._state == OnReleaseState.PRESSED_SINGLE:
+            self._state = OnReleaseState.PRESSED_SILENT
 
     def process_event(self, event):
         if event.value == 0:
-            self._pressed = False
+            self._state = OnReleaseState.RELEASED
+            if self._previous_state == OnReleaseState.PRESSED_SINGLE:
+                if self._callbacks:
+                    for callback in self._callbacks:
+                        callback()
         if event.value == 1:
-            self._pressed = True
-        if event.value == 2:
-            if not self._triggered:
-                self._triggered = True
+            if self._silence_modifier and self._silence_modifier.active:
+                self._state = OnReleaseState.PRESSED_SILENT
+            else:
+                self._state = OnReleaseState.PRESSED_SINGLE
         return True
 
+    def flush_state_change(self, sync_event):
+        if self._previous_state == OnReleaseState.PRESSED_SINGLE and \
+           self._state == OnReleaseState.RELEASED:
+            event = evdev.InputEvent(sync_event.sec, sync_event.usec,
+                                     evdev.ecodes.EV_KEY, self._extra_code, 1)
+            self._keyboard.write_event(event)
+            event.value = 0
+            self._keyboard.write_event(event)
+        self._previous_state = self._state
+
+
+class OnQuickReleaseKey(OnReleaseKey):
+    def __init__(self, keyboard, extra_code, delay=None, **kwargs):
+        super().__init__(keyboard, extra_code, **kwargs)
+
+    def process_event(self, event):
+        ret = super().process_event(event)
+        if event.value == 2:
+            self.silence_release()
+        return ret
+
+
+class SingleOrModifierKey(VirtualModifierKey, OnReleaseKey):
+    def __init__(self, keyboard, single_code, virtual_modifier, **kwargs):
+        super().__init__(keyboard, extra_code=single_code,
+                         virtual_modifier=virtual_modifier,
+                         silence_modifier=virtual_modifier, **kwargs)
+
+
+class RemapKey(Key):
+    def __init__(self, keyboard, code):
+        super().__init__(keyboard)
+        self._code = code
+
     def flush_event(self, event):
+        event.code = self._code
+        super().flush_event(event)
+
+
+class ModKey():
+    def __init__(self, normal_key, virtual_modifier, modified_key):
+        self._normal_key = normal_key
+        self._virtual_modifier = virtual_modifier
+        self._modified_key = modified_key
+        self._active_key = None
+        self._releasing = False
+        self._wants_release_event = False
+
+    def process_event(self, event):
+        if self._releasing:
+            return False
         if event.value == 0:
-            if self._triggered:
-                self._triggered = False
-            else:
-                main_code = event.code
-                event.code = self._extra_code
-                event.value = 1
-                self._keyboard.write_event(event)
+            self._releasing = True
+            self._wants_release_event = self._active_key.process_event(event)
+            return True
+        elif event.value == 1:
+            if not self._active_key:
+                self._virtual_modifier.trigger_silent()
+                if self._virtual_modifier.active:
+                    self._active_key = self._modified_key
+                else:
+                    self._active_key = self._normal_key
+        if self._active_key:
+            return self._active_key.process_event(event)
+        else:
+            return False
+
+    def flush_state_change(self, sync_event):
+        if self._active_key:
+            self._active_key.flush_state_change(sync_event)
+
+    def flush_event(self, event):
+        if self._releasing and event.value == 0:
+            if self._active_key and self._wants_release_event:
+                self._active_key.flush_event(event)
+                self._wants_release_event = False
+            self._releasing = False
+            self._active_key = None
+        elif self._active_key:
+            self._active_key.flush_event(event)
+
+    def __getattr__(self, name):
+        return self._normal_key.__getattribute__(name)
+
+
+class SecondTouchKey(OnQuickReleaseKey):
+    def __init__(self, keyboard, first_code, second_code, force_modifier=None, **kwargs):
+        super().__init__(keyboard, extra_code=first_code,
+                         silence_modifier=force_modifier, **kwargs)
+        self._second_code = second_code
+        self._force_modifier = force_modifier
+        self._repeating = False
+
+    def process_event(self, event):
+        if event.value == 1 and self._force_modifier:
+            self._force_modifier.trigger_silent()
+            if self._force_modifier.active:
+                self._repeating = True
+        super().process_event(event)
+        return event.value == 2 and self._repeating
+
+    def flush_state_change(self, sync_event):
+        if self._state == OnReleaseState.PRESSED_SILENT and \
+           self._previous_state != OnReleaseState.PRESSED_SILENT:
+            event = evdev.InputEvent(sync_event.sec, sync_event.usec,
+                                     evdev.ecodes.EV_KEY, self._second_code, 1)
+            self._keyboard.write_event(event)
+            if not self._repeating:
                 event.value = 0
                 self._keyboard.write_event(event)
-                event.code = main_code
-        super().flush_event(event)
+        if self._state != OnReleaseState.PRESSED_SILENT and \
+           self._previous_state == OnReleaseState.PRESSED_SILENT and \
+           self._repeating:
+            event = evdev.InputEvent(sync_event.sec, sync_event.usec,
+                                     evdev.ecodes.EV_KEY, self._second_code, 0)
+            self._keyboard.write_event(event)
+            self._repeating = False
+        super().flush_state_change(sync_event)
+
 
 class Keyboard:
     def __init__(self, path):
@@ -201,42 +338,104 @@ class Keyboard:
             self._device.close()
             raise
         self._logger = self._logger.getChild(name)
-        self._logger.info(f'Initialized at {path}')
+        self._logger.info('Initialized at %s', path)
         right_alt = VirtualModifier(self, evdev.ecodes.KEY_CAPSLOCK)
-        self._virtual_modifiers = [right_alt]
+        fn = VirtualModifier(self, None)
+        self._virtual_modifiers = [right_alt, fn]
         basic_key = Key(self)
-        left_meta = OnReleaseKey(self, evdev.ecodes.KEY_D, right_alt.trigger)
-        right_meta = OnReleaseKey(self, evdev.ecodes.KEY_F, right_alt.trigger)
+        left_meta = TriggerKey(
+            OnQuickReleaseKey(self, evdev.ecodes.KEY_D, silence_modifier=right_alt),
+            right_alt.trigger_silent)
+        right_meta = TriggerKey(
+            OnQuickReleaseKey(self, evdev.ecodes.KEY_F, silence_modifier=right_alt),
+            right_alt.trigger_silent)
         self._special_keys = {
             evdev.ecodes.KEY_LEFTSHIFT: basic_key,
             evdev.ecodes.KEY_RIGHTSHIFT: basic_key,
             evdev.ecodes.KEY_LEFTCTRL: basic_key,
             evdev.ecodes.KEY_RIGHTCTRL: basic_key,
-            evdev.ecodes.KEY_CAPSLOCK: TriggeredModifierKey(self, evdev.ecodes.KEY_ESC, right_alt),
+            evdev.ecodes.KEY_CAPSLOCK: SingleOrModifierKey(
+                self, evdev.ecodes.KEY_ESC, right_alt,
+                callbacks=[left_meta.silence_release, right_meta.silence_release]),
             evdev.ecodes.KEY_LEFTALT: basic_key,
-            evdev.ecodes.KEY_RIGHTALT: TriggeredModifierKey(self, evdev.ecodes.KEY_COMPOSE, right_alt),
+            evdev.ecodes.KEY_RIGHTALT: SingleOrModifierKey(
+                self, evdev.ecodes.KEY_COMPOSE, right_alt,
+                callbacks=[left_meta.silence_release, right_meta.silence_release]),
             evdev.ecodes.KEY_LEFTMETA: left_meta,
             evdev.ecodes.KEY_RIGHTMETA: right_meta,
-            evdev.ecodes.KEY_MENU: basic_key,
+            evdev.ecodes.KEY_MENU: ModifierKey(self, fn),
+            evdev.ecodes.KEY_COMPOSE: ModifierKey(self, fn),
+            evdev.ecodes.KEY_F1: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F13, evdev.ecodes.KEY_F1, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_COMPUTER)),
+            evdev.ecodes.KEY_F2: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F14, evdev.ecodes.KEY_F2, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_HOMEPAGE)),
+            evdev.ecodes.KEY_F3: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F15, evdev.ecodes.KEY_F3, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_CALC)),
+            evdev.ecodes.KEY_F4: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F16, evdev.ecodes.KEY_F4, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_MEDIA)),
+            evdev.ecodes.KEY_F5: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F17, evdev.ecodes.KEY_F5, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_NEXTSONG)),
+            evdev.ecodes.KEY_F6: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F18, evdev.ecodes.KEY_F6, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_PREVIOUSSONG)),
+            evdev.ecodes.KEY_F7: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F19, evdev.ecodes.KEY_F7, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_PLAYPAUSE)),
+            evdev.ecodes.KEY_F8: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F20, evdev.ecodes.KEY_F8, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_STOP)),
+            evdev.ecodes.KEY_F9: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F21, evdev.ecodes.KEY_F9, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_MUTE)),
+            evdev.ecodes.KEY_F10: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F22, evdev.ecodes.KEY_F10, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_VOLUMEDOWN)),
+            evdev.ecodes.KEY_F11: ModKey(
+                SecondTouchKey(self, evdev.ecodes.KEY_F23, evdev.ecodes.KEY_F11, right_alt),
+                fn, RemapKey(self, evdev.ecodes.KEY_VOLUMEUP)),
+            evdev.ecodes.KEY_F12: SecondTouchKey(
+                self, evdev.ecodes.KEY_F24, evdev.ecodes.KEY_F12, right_alt),
+            evdev.ecodes.KEY_SYSRQ: ModKey(
+                RemapKey(self, evdev.ecodes.KEY_PROG3), right_alt, basic_key),
+            evdev.ecodes.KEY_SCROLLLOCK: ModKey(
+                RemapKey(self, evdev.ecodes.KEY_PROG3), right_alt, basic_key),
+            evdev.ecodes.KEY_PAUSE: ModKey(
+                RemapKey(self, evdev.ecodes.KEY_PROG4), right_alt, basic_key),
+            evdev.ecodes.KEY_BREAK: ModKey(
+                RemapKey(self, evdev.ecodes.KEY_PROG4), right_alt, basic_key),
         }
-        self._default_key = TriggerKey(self, right_alt.trigger, left_meta.trigger, right_meta.trigger)
+        self._default_key = TriggerKey(
+            basic_key, left_meta.silence_release, right_meta.silence_release,
+            right_alt.trigger_noisy)
         self._backlog = []
+        self._await_later = []
 
-    async def process_events(self):
+    async def process_events(self, interrupted):
         try:
             with self._device.grab_context():
                 async for event in self._device.async_read_loop():
                     self._process_event(event)
         except asyncio.CancelledError:
             pass
+        except:
+            interrupted.set()
+            raise
         finally:
             self._uinput.close()
             self._device.close()
+            self._logger.info('Closed')
 
     def _process_event(self, event):
         if event.type == evdev.ecodes.EV_SYN:
             for virtual_modifier in self._virtual_modifiers:
                 virtual_modifier.flush_state_change(event)
+            for key in self._special_keys.values():
+                key.flush_state_change(event)
             for buffered_event in self._backlog:
                 buffered_event.sec = event.sec
                 buffered_event.usec = event.usec
@@ -253,13 +452,14 @@ class Keyboard:
         return self._special_keys.get(code, self._default_key)
 
     def write_event(self, event):
-        self._logger.debug(f'out: {repr(event)}')
+        self._logger.debug('out: %r', event)
         self._uinput.write_event(event)
 
 
 class KeyboardRemapper:
-    def __init__(self):
+    def __init__(self, interrupted):
         self._logger = logging.getLogger(type(self).__qualname__)
+        self._interrupted = interrupted
         self._devices = {}
         self._context = pyudev.Context()
         self._monitor = pyudev.Monitor.from_netlink(self._context)
@@ -277,7 +477,7 @@ class KeyboardRemapper:
     async def stop(self):
         for task in self._devices.values():
             task.cancel()
-        asyncio.gather(*self._devices.values())
+        await asyncio.gather(*self._devices.values())
 
     def _poll_udev_event(self):
         device = self._monitor.poll()
@@ -306,7 +506,7 @@ class KeyboardRemapper:
                 self._logger.exception(
                     f'Cannot initialize {device_path} at {device_node}')
                 return
-            task = asyncio.create_task(keyboard.process_events(),
+            task = asyncio.create_task(keyboard.process_events(self._interrupted),
                                        name=f'remap {device_path}')
             self._devices[device_path] = task
 
@@ -337,19 +537,29 @@ class KeyboardRemapper:
             task.cancel()
 
 
+async def _timeout(timeout, interrupted):
+    try:
+        await asyncio.sleep(timeout)
+        interrupted.set()
+    except asyncio.CancelledError:
+        pass
+
+
 async def main(timeout):
     interrupted = asyncio.Event()
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGINT, interrupted.set)
-    tasks = [interrupted.wait()]
-    if timeout is not None:
-        tasks.append(asyncio.sleep(timeout))
-    keyboard_remapper = KeyboardRemapper()
+    if timeout:
+        timeout_task = asyncio.create_task(_timeout(timeout, interrupted))
+    keyboard_remapper = KeyboardRemapper(interrupted)
     try:
         await keyboard_remapper.start()
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        await interrupted.wait()
     finally:
         loop.remove_signal_handler(signal.SIGINT)
+        if timeout_task:
+            timeout_task.cancel()
+            await timeout_task
         await keyboard_remapper.stop()
 
 
