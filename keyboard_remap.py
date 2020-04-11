@@ -344,7 +344,7 @@ class Keyboard:
             evdev.ecodes.KEY_F16,
             evdev.ecodes.KEY_F17,
             evdev.ecodes.KEY_F18,
-            evdev.ecodes.KEY_F18,
+            evdev.ecodes.KEY_F19,
             evdev.ecodes.KEY_F20,
             evdev.ecodes.KEY_F21,
             evdev.ecodes.KEY_F22,
