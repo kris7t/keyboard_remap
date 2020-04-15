@@ -363,6 +363,7 @@ class Keyboard:
             evdev.ecodes.KEY_VOLUMEUP,
             evdev.ecodes.KEY_PROG1,
             evdev.ecodes.KEY_PROG2,
+            evdev.ecodes.KEY_SEARCH,
             evdev.ecodes.KEY_BACK,
             evdev.ecodes.KEY_FORWARD,
         })
@@ -384,6 +385,9 @@ class Keyboard:
         right_meta = TriggerKey(
             OnQuickReleaseKey(self, evdev.ecodes.KEY_F, silence_modifier=right_alt),
             right_alt.trigger_silent)
+        left_alt = TriggerKey(
+            OnQuickReleaseKey(self, evdev.ecodes.KEY_SEARCH, silence_modifier=right_alt),
+            right_alt.trigger_silent)
         self._special_keys = {
             evdev.ecodes.KEY_LEFTSHIFT: basic_key,
             evdev.ecodes.KEY_RIGHTSHIFT: basic_key,
@@ -392,7 +396,7 @@ class Keyboard:
             evdev.ecodes.KEY_CAPSLOCK: SingleOrModifierKey(
                 self, evdev.ecodes.KEY_ESC, right_alt,
                 callbacks=[left_meta.silence_release, right_meta.silence_release]),
-            evdev.ecodes.KEY_LEFTALT: basic_key,
+            evdev.ecodes.KEY_LEFTALT: left_alt,
             evdev.ecodes.KEY_RIGHTALT: SingleOrModifierKey(
                 self, evdev.ecodes.KEY_COMPOSE, right_alt,
                 callbacks=[left_meta.silence_release, right_meta.silence_release]),
