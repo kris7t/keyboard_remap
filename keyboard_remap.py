@@ -363,6 +363,8 @@ class Keyboard:
             evdev.ecodes.KEY_VOLUMEUP,
             evdev.ecodes.KEY_PROG1,
             evdev.ecodes.KEY_PROG2,
+            evdev.ecodes.KEY_BACK,
+            evdev.ecodes.KEY_FORWARD,
         })
         try:
             self._uinput = evdev.UInput(
@@ -441,10 +443,14 @@ class Keyboard:
                 RemapKey(self, evdev.ecodes.KEY_PROG2), right_alt, basic_key),
             evdev.ecodes.KEY_BREAK: ModKey(
                 RemapKey(self, evdev.ecodes.KEY_PROG2), right_alt, basic_key),
+            evdev.ecodes.KEY_LEFT: ModKey(
+                basic_key, right_alt, RemapKey(self, evdev.ecodes.KEY_BACK)),
+            evdev.ecodes.KEY_RIGHT: ModKey(
+                basic_key, right_alt, RemapKey(self, evdev.ecodes.KEY_FORWARD)),
         }
         self._default_key = TriggerKey(
             basic_key, left_meta.silence_release, right_meta.silence_release,
-            right_alt.trigger_noisy)
+            left_alt.silence_release, right_alt.trigger_noisy)
         self._backlog = []
         self._await_later = []
 
